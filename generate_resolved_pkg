@@ -1,0 +1,256 @@
+#!/usr/bin/bash
+
+# Copyright 2019-2022 VMware, Inc.
+# SPDX-License-Identifier: Apache-2
+
+# shellcheck disable=SC2082,SC2034,SC2128,SC2001,SC2162,SC2181
+
+set -o functrace
+set -o pipefail
+
+# using bash for now, not path is for Solaris opencsw
+# run this script as root
+
+SCRIPT_VERSION='2022.11.04.01'
+
+
+# helper functions
+
+_timestamp() {
+    date "+%Y-%m-%d %H:%M:%S:"
+}
+
+_log() {
+    echo "$1" | sed "s/^/$(_timestamp) /" >>"${LOGGING}"
+}
+
+# Both echo and log
+_display() {
+    echo "$1"
+    _log "$1"
+}
+
+_error() {
+    msg="ERROR: $1"
+    echo "$msg" 1>&2
+    echo "$(_timestamp) $msg" >>"${LOGGING}"
+    echo "One or more errors found. See ${LOGGING} for details." 1>&2
+    exit 1
+}
+
+_warning() {
+    msg="WARNING: $1"
+    echo "$msg" 1>&2
+    echo "$(_timestamp) $msg" >>"${LOGGING}"
+}
+
+_usage() {
+    echo "usage: $0 <absolute path to work area> <salt-package-repository>"
+    echo "    generate resolved 64-bit solaris 11 IPS packages for Salt"
+    echo "    for example for Salt version 3002.2 :"
+    echo "      $0 /export/home/user/dev_area salt_sun11_repo_3002_2"
+    echo " "
+}
+
+
+_yesno() {
+read -p "Continue (y/n)?" choice
+case "$choice" in
+  y|Y ) echo "yes";;
+  n|N ) echo "no";;
+  * ) echo "invalid";;
+esac
+}
+
+# work functions
+
+_generate_resolved_pkg() {
+    # first param is absolute path to work area directory
+    # second param is working package name, e.g. zeromq-4.2.1
+
+    WORKAREA_ABS_DIR=${1}
+    WORK_PKG_NAME=${2}
+    BYPASS_GENERATE_LIST=${3}
+
+    pkgsend generate "${WORKAREA_ABS_DIR}" > "${WORK_PKG_NAME}.p5m.1" || {
+        _error "$0:$FUNCNAME failed pkgsend generate for '${WORKAREA_ABS_DIR}', retcode '${$?}'";
+    }
+    if [[ $# -eq 3 ]]; then
+        # get output of ${WORK_PKG_NAME}.p5m.1 minus the ${BYPASS_GENERATE_LIST} into tmp file
+        # append ${BYPASS_GENERATE_LIST} and ' pkg.depend.bypass-generate=.*' to the tmp file
+        # write tmp file to ${WORK_PKG_NAME}.p5m.1
+
+        _display "$0:$FUNCNAME adding dependency bypass-generate to file '${WORK_PKG_NAME}.p5m.1'";
+
+        tmpfile_input=$(mktemp /tmp/bypass_depfile_ip.XXXXXX)
+        tmpfile_deps=$(mktemp /tmp/bypass_depfile_sortdeps.XXXXXX)
+        tmpfile_adjust=$(mktemp /tmp/bypass_depfile_sortadj.XXXXXX)
+        tmpfile_result=$(mktemp /tmp/bypass_depfilei_result.XXXXXX)
+
+        echo "${BYPASS_GENERATE_LIST}" > "${tmpfile_input}"
+
+        sort "${WORK_PKG_NAME}.p5m.1" -o "${tmpfile_deps}"
+        sort "${tmpfile_input}" -o "${tmpfile_adjust}"
+
+        comm -23 "${tmpfile_deps}" "${tmpfile_adjust}" > "${tmpfile_result}"
+        while IFS= read -r fileline
+        do
+            if [[ -n "${fileline}" ]]; then
+                echo "${fileline}  pkg.depend.bypass-generate=.*" >> "${tmpfile_result}"
+            fi
+        done < "${tmpfile_input}"
+
+        cat "${tmpfile_result}" > "${WORK_PKG_NAME}.p5m.1"
+
+        rm -f "${tmpfile_input}"
+        rm -f "${tmpfile_deps}"
+        rm -f "${tmpfile_adjust}"
+        rm -f "${tmpfile_result}"
+    fi
+
+    pkgmogrify -DARCH="$(uname -p)" "${WORK_PKG_NAME}.p5m.1" "${WORK_PKG_NAME}.mog" > "${WORK_PKG_NAME}.p5m.2" || {
+        _error "$0:$FUNCNAME failed pkgmogrify with '${WORK_PKG_NAME}.p5m.1' and '${WORK_PKG_NAME}.mog' for '${WORK_PKG_NAME}.p5m.2', retcode '${$?}'";
+    }
+
+    pkgdepend generate -md "${WORKAREA_ABS_DIR}" "${WORK_PKG_NAME}.p5m.2" > "${WORK_PKG_NAME}.p5m.3" || {
+        _error "$0:$FUNCNAME failed pkgdepend generate for '${WORKAREA_ABS_DIR}' and '${WORK_PKG_NAME}.p5m.2' for '${WORK_PKG_NAME}.p5m.3', retcode '${$?}'";
+    }
+    pkgdepend resolve -m "${WORK_PKG_NAME}.p5m.3" || {
+        _error "$0:$FUNCNAME failed pkgdepend resolve, retcode '${$?}'";
+    }
+
+    ## _yesno
+
+    # publish the package to the local repository
+    pkgsend publish -s "/export/${SUN_REPO_NAME}" -d "${WORKAREA_ABS_DIR}" "${WORK_PKG_NAME}.p5m.3.res" || {
+        _error "$0:$FUNCNAME publishing ${WORK_PKG_NAME} from ${WORK_PKG_NAME} to repo '${SUN_REPO_NAME}' failed, retcode '${$?}'"
+    }
+    # refresh repository so dependencies can be met
+    pkgrepo refresh -s "/export/${SUN_REPO_NAME}" || {
+        _error "$0:$FUNCNAME refresh of repo '${SUN_REPO_NAME}' failed, retcode '${$?}'"
+    }
+    # rebuild repository so dependencies can be met
+    pkgrepo rebuild -s "/export/${SUN_REPO_NAME}" || {
+        _error "$0:$FUNCNAME rebuild of repo '${SUN_REPO_NAME}' failed, retcode '${$?}'"
+    }
+
+    pkgrepo refresh -s "/export/${SUN_REPO_NAME}" || {
+        _error "$0:$FUNCNAME refresh running service for repo '${SUN_REPO_NAME}' failed, retcode '${$?}'"
+    }
+
+    pkgrepo rebuild -s "/export/${SUN_REPO_NAME}" || {
+        _error "$0:$FUNCNAME rebuild running service for repo '${SUN_REPO_NAME}' failed, retcode '${$?}'"
+    }
+
+}
+
+
+################################### MAIN ####################################
+
+# static definitions
+
+# PATH=/opt/local/bin:/opt/csw/bin:/opt/csw/sbin:/opt/csw/gnu:$PATH
+# export PATH
+
+CURRDIR=$(pwd)
+
+# Always 64bit right now
+BYTEWIDTH='64bit'
+
+ARCH_x86="i386"
+ARCH_SPARC="sparc"
+ARCH=
+
+# OS Release
+# get the OS level for Solaris that we are build on
+SYSRELEASE_VER=$(uname -r)
+SYSRELEASE_511='5.11'   # Solaris 11
+
+OSRELEASE_VER=$( echo "${SYSRELEASE_VER}" | cut -d '.' -f2 )
+OSRELEASE_DOTTED="solaris-2.${OSRELEASE_VER}"
+OSRELEASE="solaris-2_${OSRELEASE_VER}"
+
+
+#check platform first
+if [[ $(uname -m) = 'i86pc' ]];then
+    ARCH=${ARCH_x86}
+elif [[ $(uname -m) = 'sun4v' ]]; then
+    ARCH=${ARCH_SPARC}
+else
+    _error "$0 does not support this platform"
+fi
+
+
+# set logging infomation
+# want verbose while developing
+VERBOSE=1
+LOGGING="/dev/null"
+
+log_file_format="${CURRDIR}/$0-${OSRELEASE}-${ARCH}.%Y%m%d%H%M%S.log"
+log_file="$(date \"+"${log_file_format}"\")"
+
+if [[ ${VERBOSE} -ne 0 ]];then
+    LOGGING="${log_file}"
+else
+LOGGING="/dev/null"
+fi
+
+
+_display "$0: PATH is now set to '$PATH'"
+
+_ret=
+
+
+files_to_adjust="file opt/saltstack/salt/run/_cffi_backend.cpython-39.so group=bin mode=0755 owner=root path=opt/saltstack/salt/run/_cffi_backend.cpython-39.so
+file opt/saltstack/salt/run/cryptography/hazmat/bindings/_openssl.abi3.so group=bin mode=0755 owner=root path=opt/saltstack/salt/run/cryptography/hazmat/bindings/_openssl.abi3.so
+file opt/saltstack/salt/run/cryptography/hazmat/bindings/_padding.abi3.so group=bin mode=0755 owner=root path=opt/saltstack/salt/run/cryptography/hazmat/bindings/_padding.abi3.so
+file opt/saltstack/salt/run/libz.so.1 group=bin mode=0755 owner=root path=opt/saltstack/salt/run/libz.so.1
+file opt/saltstack/salt/run/libzmq.so.5 group=bin mode=0755 owner=root path=opt/saltstack/salt/run/libzmq.so.5
+file opt/saltstack/salt/run/markupsafe/_speedups.cpython-39.so group=bin mode=0755 owner=root path=opt/saltstack/salt/run/markupsafe/_speedups.cpython-39.so
+file opt/saltstack/salt/run/msgpack/_cmsgpack.cpython-39.so group=bin mode=0755 owner=root path=opt/saltstack/salt/run/msgpack/_cmsgpack.cpython-39.so
+file opt/saltstack/salt/run/zmq/backend/cython/_version.cpython-39.so group=bin mode=0755 owner=root path=opt/saltstack/salt/run/zmq/backend/cython/_version.cpython-39.so
+file opt/saltstack/salt/run/zmq/backend/cython/context.cpython-39.so group=bin mode=0755 owner=root path=opt/saltstack/salt/run/zmq/backend/cython/context.cpython-39.so
+file opt/saltstack/salt/run/zmq/backend/cython/error.cpython-39.so group=bin mode=0755 owner=root path=opt/saltstack/salt/run/zmq/backend/cython/error.cpython-39.so
+file opt/saltstack/salt/run/zmq/backend/cython/message.cpython-39.so group=bin mode=0755 owner=root path=opt/saltstack/salt/run/zmq/backend/cython/message.cpython-39.so
+file opt/saltstack/salt/run/zmq/backend/cython/socket.cpython-39.so group=bin mode=0755 owner=root path=opt/saltstack/salt/run/zmq/backend/cython/socket.cpython-39.so
+file opt/saltstack/salt/run/zmq/backend/cython/utils.cpython-39.so group=bin mode=0755 owner=root path=opt/saltstack/salt/run/zmq/backend/cython/utils.cpython-39.so
+file opt/saltstack/salt/run/zmq/devices/monitoredqueue.cpython-39.so group=bin mode=0755 owner=root path=opt/saltstack/salt/run/zmq/devices/monitoredqueue.cpython-39.so
+file opt/saltstack/salt/run/libstdc++.so.6 group=bin mode=0755 owner=root path=opt/saltstack/salt/run/libstdc++.so.6
+file opt/saltstack/salt/run/libffi.so.6 group=bin mode=0755 owner=root path=opt/saltstack/salt/run/libffi.so.6
+file opt/saltstack/salt/run/libsocket.so.1 group=bin mode=0755 owner=root path=opt/saltstack/salt/run/libsocket.so.1
+file opt/saltstack/salt/run/libreadline.so.6 group=bin mode=0755 owner=root path=opt/saltstack/salt/run/libreadline.so.6
+file opt/saltstack/salt/run/zmq/backend/cython/_proxy_steerable.cpython-39.so group=bin mode=0755 owner=root path=opt/saltstack/salt/run/zmq/backend/cython/_proxy_steerable.cpython-39.so
+file opt/saltstack/salt/run/zmq/backend/cython/_poll.cpython-39.so group=bin mode=0755 owner=root path=opt/saltstack/salt/run/zmq/backend/cython/_poll.cpython-39.so
+file opt/saltstack/salt/run/zmq/backend/cython/_device.cpython-39.so group=bin mode=0755 owner=root path=opt/saltstack/salt/run/zmq/backend/cython/_device.cpython-39.so
+file opt/saltstack/salt/run/timelib.cpython-39.so group=bin mode=0755 owner=root path=opt/saltstack/salt/run/timelib.cpython-39.so
+file opt/saltstack/salt/run/salt/templates/lxc/salt_tarball group=bin mode=0755 owner=root path=opt/saltstack/salt/run/salt/templates/lxc/salt_tarball
+file opt/saltstack/salt/run/salt/templates/git/ssh-id-wrapper group=bin mode=0755 owner=root path=opt/saltstack/salt/run/salt/templates/git/ssh-id-wrapper
+file opt/saltstack/salt/run/run group=bin mode=0755 owner=root path=opt/saltstack/salt/run/run
+file opt/saltstack/salt/run/psutil/_psutil_posix.cpython-39.so group=bin mode=0755 owner=root path=opt/saltstack/salt/run/psutil/_psutil_posix.cpython-39.so
+file opt/saltstack/salt/run/psutil/_psutil_sunos.cpython-39.so group=bin mode=0755 owner=root path=opt/saltstack/salt/run/psutil/_psutil_sunos.cpython-39.so
+file opt/saltstack/salt/run/libuuid.so.1 group=bin mode=0755 owner=root path=opt/saltstack/salt/run/libuuid.so.1
+file opt/saltstack/salt/run/libbz2.so.1 group=bin mode=0755 owner=root path=opt/saltstack/salt/run/libbz2.so.1
+file opt/saltstack/salt/run/libgcc_s.so.1 group=bin mode=0755 owner=root path=opt/saltstack/salt/run/libgcc_s.so.1
+file opt/saltstack/salt/run/libkstat.so.1 group=bin mode=0755 owner=root path=opt/saltstack/salt/run/libkstat.so.1
+file opt/saltstack/salt/run/libsqlite3.so.0 group=bin mode=0755 owner=root path=opt/saltstack/salt/run/libsqlite3.so.0
+file opt/saltstack/salt/run/lib-dynload/_ssl.cpython-39.so group=bin mode=0755 owner=root path=opt/saltstack/salt/run/lib-dynload/_ssl.cpython-39.so
+file opt/saltstack/salt/run/lib-dynload/_hashlib.cpython-39.so group=bin mode=0755 owner=root path=opt/saltstack/salt/run/lib-dynload/_hashlib.cpython-39.so
+file opt/saltstack/salt/run/_scrypt.cpython-39.so group=bin mode=0755 owner=root path=opt/saltstack/salt/run/_scrypt.cpython-39.so
+file opt/saltstack/salt/run/libssl.so.1.1 group=bin mode=0755 owner=root path=opt/saltstack/salt/run/libssl.so.1.1
+file lib/svc/manifest/site/salt-minion.xml group=bin mode=0644 owner=root path=lib/svc/manifest/site/salt-minion.xml
+"
+
+if [[ $# -ne 2 ]];then
+    _usage
+    exit 0
+fi
+
+ABS_PATH="$1"
+SUN_REPO_NAME="$2"
+
+pkgrepo verify -s "/export/${SUN_REPO_NAME}"
+if [[ "$?" -ne 0 ]]; then
+    _error "$0 failed to find packages repo for '${SUN_REPO_NAME}' for Salt version '${SALT_VER}' does not exist, retcode '${$?}'"
+fi
+
+_generate_resolved_pkg "${ABS_PATH}" "salt" "${files_to_adjust}"

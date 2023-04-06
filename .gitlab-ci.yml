@@ -1,0 +1,1029 @@
+# Copyright 2019-2022 VMware, Inc.
+# SPDX-License-Identifier: Apache-2
+
+---
+stages:
+  - lint
+  - build_pkg
+  - test_pkg
+##   - upload
+##   - release
+
+
+##  building trial version of CI here which should eventually move to utilize
+## ci-templates.  Trying here first allows for issues to be worked out without
+## having to handle two different branches
+
+## certs sub-directory contains the keys and certs used to install studio
+## and sign the build product, need to be protected if make public
+## that is, create a fresh repo excluding them so no history etc.
+
+variables:
+  PLUGIN_PACKAGES: "*.p5p"
+  CICD_UPSTREAM_PATH: "saltstack/open/salt-native-minion-solaris11"
+  ## CICD_JFROG_BLOB_PATTERN: "*.p5p"
+  ## CICD_JFROG_BLOB_REPO: "enterprise-staging"
+  ## CICD_JFROG_BLOB_TAG_REPO: "enterprise-production"
+  ## CICD_JFROG_BLOG_REPO_PATH: "solaris11"
+  ## CICD_SALT_DIST_VERSION:  "3004.1"
+  CICD_SALT_VERSION:  "3001.1"
+  CICD_SALT_RELEASE:  "1"
+  CICD_SALT_DATE: "Thu Jan 1 1970"
+  CICD_SALT_LOCATION: "salt"
+  CICD_SALT_DEV_BRANCH: "master"
+  CICD_ZEROMQ_VER: "4.3.3"
+  CICD_OPENSSL_VER: "1.1.1q"
+  CICD_PYTHON_VER: "3.9.14"
+  ## CICD_PYTHON_VER: "3.7.10"
+  PYINSTALLER_VER: "5.5"
+
+
+workflow:
+  rules:
+    - if: $CI_MERGE_REQUEST_ID == null
+
+## include:
+##   # upload jobs
+##   - project: "saltstack/pop/cicd/ci-templates"
+##     file: "//upload_blob_jfrog.yml"
+##   # release jobs
+##   - project: "saltstack/pop/cicd/ci-templates"
+##     file: "/release/release_blob.yml"
+
+
+default:
+  before_script:
+    - mkdir /root/ || true
+    - echo "machine artifactory.saltstack.net login $ARTIFACTORY_USERNAME password $ARTIFACTORY_API_TOKEN" > ~/.netrc
+    - echo "machine gitlab.com login gitlab-ci-token password ${CI_JOB_TOKEN}" >> ~/.netrc
+
+
+build-solaris11-intel:
+  stage: build_pkg
+  artifacts:
+    name: "$CI_JOB_NAME-$CI_COMMIT_REF_NAME"
+    paths:
+      - "*.p5p"
+    expire_in: 120 days
+    reports:
+      dotenv: build.env
+  tags:
+    - solaris11
+  script:
+    - oldpwd=$(pwd)
+    - date
+    - svcadm disable ntp
+    - ntpdate -s time.nist.gov
+    - date
+    - cd ${oldpwd}
+    - export ARCH=$(uname -p)
+    - echo "ARCH is ${ARCH}"
+    - rm -fR dist
+    - rm -fR build
+    - rm -fR dev_openssl
+    - rm -fR dev_python3
+    - mkdir dev_openssl
+    - mkdir dev_python3
+    - mkdir -p /usr/local/lib
+    - mkdir -p /usr/local/bin
+    - pkg change-facet facet.devel=true
+    - pkg install gcc system/header developer/build/pkg-config git developer/build/make text/gnu-patch developer/build/gnu-make text/gnu-grep
+    - export  PKG_CONFIG_PATH=/usr/lib/64/pkgconfig
+    - export PATH=/usr/gnu/bin:$PATH
+    - export CFLAGS=$(pkg-config --cflags libffi)
+    - export PATH=$PATH:/usr/perl5/bin
+    - cd ${oldpwd}
+    - cd dev_openssl
+    - wget --no-check-certificate https://www.openssl.org/source/openssl-${CICD_OPENSSL_VER}.tar.gz
+    - tar -xvzf openssl-${CICD_OPENSSL_VER}.tar.gz
+    - cd openssl-${CICD_OPENSSL_VER}
+    - export OPENSSL_COMPLIER=""
+    - if [[ "sparc" = "${ARCH}" ]]; then OPENSSL_COMPLIER="solaris64-sparcv9-gcc"; else OPENSSL_COMPLIER="solaris64-x86_64-gcc"; fi
+    - ./Configure "${OPENSSL_COMPLIER}" --prefix=/usr/local/openssl --openssldir=/usr/local/openssl 2>&1 | tee ~/myopenssl.log
+    - make 2>&1 | tee ~/mybuild.log
+    - make install 2>&1 | tee -a ~/mybuild.log
+    - cd /usr/bin
+    - if [[ ! -e /usr/bin/openssl.orig ]]; then mv openssl openssl.orig ; ln -s /usr/local/openssl/bin/openssl /usr/bin/openssl; fi
+    - export LDFLAGS+=$(PKG_CONFIG_PATH=/usr/local/openssl/lib/pkgconfig pkg-config --libs-only-L libcrypto libssl)
+    - export CPPFLAGS+=$(PKG_CONFIG_PATH=/usr/local/openssl/lib/pkgconfig pkg-config --cflags libcrypto libssl)
+    - export CFLAGS+=$(PKG_CONFIG_PATH=/usr/local/openssl/lib/pkgconfig pkg-config --cflags libcrypto libssl)
+    - export CFLAGS="-DFFI_NO_RAW_API -I/usr/lib/amd64/libffi-3.2.1/include -I/usr/local/openssl/include"
+    - crle -l /usr/local/openssl/lib:/usr/local/lib:/lib:/usr/lib
+    - crle -64 -l /usr/local/openssl/lib:/usr/local/lib:/lib/64:/usr/lib/64
+    - cd ${oldpwd}
+    - cd dev_python3
+    - wget --no-check-certificate https://www.python.org/ftp/python/${CICD_PYTHON_VER}/Python-${CICD_PYTHON_VER}.tgz
+    - tar -xvzf Python-${CICD_PYTHON_VER}.tgz
+    - cd Python-${CICD_PYTHON_VER}
+    - export LD_LIBRARY_PATH=/usr/local/openssl/lib:/usr/local/lib:$LD_LIBRARY_PATH
+    - export PATH=/usr/local/openssl/bin:/usr/local/bin:$PATH
+    - export LD_RUN_PATH=/usr/local/openssl/lib:/usr/local/lib:$LD_RUN_PATH
+    - cd Lib/ctypes
+    - patch -N < ${oldpwd}/solaris11_crle.patch
+    - cd -
+    - export PYTHON_OPTS=""
+    - if [[ "sparc" = "${ARCH}" ]]; then PYTHON_OPTS="--enable-shared --enable-ipv6"; else PYTHON_OPTS="--enable-optimizations --enable-shared --enable-ipv6"; fi
+    - ./configure ${PYTHON_OPTS} 2>&1 | tee ~/mypython.log
+    - make altinstall 2>&1 | tee -a ~/mypython.log
+    - cd /usr/bin
+    - ln -s -f /usr/local/bin/python3.9 python3
+    - ln -s -f /usr/local/bin/python3.9 python3.9
+    - ln -s -f /usr/local/bin/python3.9m-config python3.9m-config
+    - ln -s -f /usr/local/bin/pip3.9 pip3
+    ## - ln -s -f /usr/local/bin/python3.7 python3
+    ## - ln -s -f /usr/local/bin/python3.7 python3.7
+    ## - ln -s -f /usr/local/bin/python3.7m-config python3.7m-config
+    ## - ln -s -f /usr/local/bin/pip3.7 pip3
+    ## PyInstaller bootloader for Solaris 11
+    ## see https://pyinstaller.readthedocs.io/en/stable/bootloader-building.html#building-for-aix
+    ## ensure empty environment
+    - python3 -m pip install pyinstaller-hooks-contrib
+    - python3 -m pip install altgraph
+    - python3 -m pip install importlib-metadata
+    - python3 -m pip install wheel
+    - python3 -m pip install pop-config==8.0.2
+    - rm -fR ${oldpwd}/dev_pyinstaller
+    - mkdir -p ${oldpwd}/dev_pyinstaller
+    - cd ${oldpwd}/dev_pyinstaller
+    - git clone -b "v${PYINSTALLER_VER}" https://github.com/pyinstaller/pyinstaller.git
+    ## could not get it or waf to work well, so simple solution of 2-3 days of trying, create a dummy executable /opt/freeware/bin/strip file which does nothing
+    - echo '#!/usr/bin/bash' > /usr/gnu/bin/strip
+    - echo "# dummy" >> /usr/gnu/bin/strip
+    - chmod 755 /usr/gnu/bin/strip
+    - chown root:bin /usr/gnu/bin/strip
+    - cd pyinstaller/bootloader
+    - python3 ./waf configure all --gcc --target-arch=64bit
+    - cd ..
+    - export PYINSTALLER_DIR=$(pwd)
+    - python3 setup.py install
+    - cd ${oldpwd}
+    ## Build zeromq for Solaris 11
+    - rm -fR dev_zeromq
+    - mkdir dev_zeromq
+    - cd dev_zeromq
+    - wget https://github.com/zeromq/libzmq/releases/download/v${CICD_ZEROMQ_VER}/zeromq-${CICD_ZEROMQ_VER}.tar.gz  --secure-protocol=TLSv1_2
+    - tar -xvzf zeromq-${CICD_ZEROMQ_VER}.tar.gz
+    ## allow for tar giving id 1000 which isn't even valid on the system :shrug:
+    - chown -R root:root zeromq-${CICD_ZEROMQ_VER}
+    - curr_pwd=$(pwd)
+    - cd "${curr_pwd}/zeromq-${CICD_ZEROMQ_VER}"
+    - ./configure
+    - gmake
+    - gmake install
+    - cd ${oldpwd}
+    - python3 -m pip install "tiamat==7.10.7"
+    - export PATH=$PATH:${HOME}/.local/bin
+    - export CICD_SALT_DATE=$(date +"%a %b %0d %Y")
+    ## export CICD_SALT_LOCATION_NB="git+https://github.com/saltstack/salt@$CICD_SALT_DEV_BRANCH#egg=salt"
+    ## get Salt since salt-minion.xml and minion are needed below, and might as well used
+    ## it since have it rather than go back out over the net
+    - cd ${oldpwd}
+    - rm -fR dev_salt
+    - mkdir dev_salt
+    - cd dev_salt
+    ## - git clone -q https://github.com/saltstack/salt.git
+    - git clone -v -b ${CICD_SALT_DEV_BRANCH} https://github.com/saltstack/salt.git
+    - cd salt
+    - python3 setup.py -q sdist
+    - cd dist
+    ## By Hand - cd dev_salt/salt/dist
+    - ls -alh
+    - export CICD_SALT_TAR_GZ_NAME=$(ls salt-*)
+    - export CICD_SALT_LOCATION_NB=$(pwd)/${CICD_SALT_TAR_GZ_NAME}
+    - export CICD_SALT_VERSION=$(ls salt-* | sed s/salt-// | sed s/.tar.gz//)
+    - echo "${CICD_SALT_VERSION}"
+    - echo "${CICD_SALT_RELEASE}"
+    - echo "${CICD_SALT_LOCATION}"
+    - echo "${CICD_SALT_LOCATION_NB}"
+    - cd ${oldpwd}
+    - rm -f solaris11_requirements.txt
+    - cp requirements.txt solaris11_requirements.txt
+    - sed -i 's&SALT_LOCATION&'"${CICD_SALT_LOCATION_NB}"'&' solaris11_requirements.txt
+    - cat solaris11_requirements.txt
+    - export CICD_SALT_VERSION_ADJ=$(echo "${CICD_SALT_VERSION}" | sed "s/-/_/"g | sed "s/+/_/"g)
+    - echo "CICD_SALT_VERSION_ADJ is ${CICD_SALT_VERSION_ADJ}"
+    - echo "CICD_SALT_DATE=${CICD_SALT_DATE}" > build.env
+    - echo "CICD_SALT_VERSION=${CICD_SALT_VERSION}" >> build.env
+    - echo "CICD_SALT_VERSION_ADJ=${CICD_SALT_VERSION_ADJ}" >> build.env
+    - echo "CICD_SALT_RELEASE=${CICD_SALT_RELEASE}" >> build.env
+    - export SUN_REPO_NAME="salt_sun11_repo_$(echo "${CICD_SALT_VERSION_ADJ}" | sed "s/\./_/"g)"
+    - echo "SUN_REPO_NAME is ${SUN_REPO_NAME}"
+    - echo "SUN_REPO_NAME=${SUN_REPO_NAME}" >> build.env
+    - cd ${oldpwd}
+    ## now build
+    - sed -i 's&PYINSTALLER_LOCATION&'${PYINSTALLER_DIR}'&' build.conf
+    - cat build.conf
+    ## ensure clean area
+    - rm -fR dist
+    - rm -fR build
+    - tiamat --log-file ${oldpwd}/tiamat.log --log-level TRACE build -c build.conf 2>&1 | tee ${oldpwd}/mytiamat.log
+    ## now package
+    - find dist -name __pycache__ | xargs rm -fR
+    - find dist -name "*.pyc" | xargs rm -f
+    - find dist -name "*.pyo" | xargs rm -f
+    - rm -f dist/run/setuptools/command/"launcher manifest.xml"
+    - rm -f dist/run/setuptools/"script (dev).tmpl"
+    - rm -fR dev_pkg
+    - rm -f *.p5m*
+    - echo "ARCH=${ARCH}" >> build.env
+    - sed -i 's&SOLARIS_ARCH&'${ARCH}'&' salt.mog
+    - export SALT_VER_TO_USE=$(echo "${CICD_SALT_VERSION_ADJ}" | awk -F '_' '{print $1}' | sed  "s/rc/\./"g)
+    ## - export SALT_VER_TO_USE=$(echo "${CICD_SALT_VERSION}" | awk -F '_' '{print $1}' | sed  "s/rc/\./"g)
+    - echo "SALT_VER_TO_USE is ${SALT_VER_TO_USE}"
+    - sed -i 's&SALT_VER_TO_USE&'${SALT_VER_TO_USE}'&' salt.mog
+    - cat salt.mog
+    - ./create_start_repository "${SUN_REPO_NAME}"
+    - mkdir dev_pkg
+    - mkdir -p dev_pkg/opt/saltstack/salt
+    - mkdir -p dev_pkg/opt/saltstack/salt/config.dist
+    - mkdir -p dev_pkg/opt/local/etc/salt
+    - mkdir -p dev_pkg/opt/local/etc/salt/minion.d
+    - mkdir -p dev_pkg/opt/local/etc/salt/pki/minion
+    - mkdir -p dev_pkg/usr/bin
+    - cp -R dist/run dev_pkg/opt/saltstack/salt/
+    - cp salt-call salt-minion dev_pkg/usr/bin/
+    - cp dev_salt/salt/pkg/solaris/salt-minion.xml dev_pkg/opt/saltstack/salt/config.dist/
+    - cp dev_salt/salt/conf/minion dev_pkg/opt/local/etc/salt/
+    ## remove x permission otherwise errors due to no python version specified
+    - chmod 644 dev_pkg/opt/saltstack/salt/run/pip/_vendor/appdirs.py
+    - chmod 644 dev_pkg/opt/saltstack/salt/run/pip/_vendor/chardet/cli/chardetect.py
+    - chmod 644 dev_pkg/opt/saltstack/salt/run/pip/_vendor/requests/certs.py
+    - chmod 644 dev_pkg/opt/saltstack/salt/run/pkg_resources/_vendor/appdirs.py
+    ## cleanup dev_salt save space
+    ## - rm -fR dev_salt
+    - perl -pi -e 's/\/opt\/local\/bin/\/usr\/bin/' dev_pkg/opt/saltstack/salt/config.dist/salt-minion.xml
+    - perl -pi -e 's/\/etc\/salt/\/opt\/local\/etc\/salt/' dev_pkg/opt/saltstack/salt/config.dist/salt-minion.xml
+    - mkdir -p dev_pkg/lib/svc/manifest/site
+    - mv dev_pkg/opt/saltstack/salt/config.dist/salt-minion.xml dev_pkg/lib/svc/manifest/site/
+    - cd ${oldpwd}
+    - ./generate_resolved_pkg ${oldpwd}/dev_pkg ${SUN_REPO_NAME}
+    ## Sign files here if desired
+    ## values provided are examples
+    ## - pkgsign -s /export/${SUN_REPO_NAME} -a rsa-sha256 -c ${oldpwd}/certs/CompanyCert.crt -i ${oldpwd}/certs/CertProviderAuth.crt -i ${oldpwd}/certs/Root_Cert.crt -k ${oldpwd}/certs/code_signing.key '*'
+    - pkgrecv -s /export/${SUN_REPO_NAME} -a -d ./salt-${CICD_SALT_VERSION_ADJ}_solaris11_${ARCH}.p5p '*'
+
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - when: on_success
+
+
+## build-solaris11-sparc:
+##   stage: build_pkg
+##   artifacts:
+##     name: "$CI_JOB_NAME-$CI_COMMIT_REF_NAME"
+##     paths:
+##       - "*.p5p"
+##     expire_in: 120 days
+##     reports:
+##       dotenv: build.env
+##   tags:
+##     - solaris11sparc
+##   script:
+##     - oldpwd=$(pwd)
+##     - date
+##     - svcadm disable ntp
+##     - ntpdate -s time.nist.gov
+##     - date
+##     - export ARCH=$(uname -p)
+##     - echo "ARCH is ${ARCH}"
+##     - rm -fR dist
+##     - rm -fR build
+##     - rm -fR dev_openssl
+##     - rm -fR dev_python3
+##     - mkdir dev_openssl
+##     - mkdir dev_python3
+##     - mkdir -p /usr/local/lib
+##     - mkdir -p /usr/local/bin
+##     - if [[ ! -d /usr/local/bin ]]; then mkdir -p /usr/local/bin; fi
+##     - pkg change-facet facet.devel=true
+##     - pkg install gcc system/header developer/build/pkg-config git developer/build/make text/gnu-patch developer/build/gnu-make text/gnu-grep
+##     - export  PKG_CONFIG_PATH=/usr/lib/64/pkgconfig
+##     - export CFLAGS=$(pkg-config --cflags libffi)
+##     - export PATH=/usr/gnu/bin:$PATH
+##     - export CFLAGS=$(pkg-config --cflags libffi)
+##     - export PATH=$PATH:/usr/perl5/bin
+##     - mkdir dev_openssl
+##     - cd dev_openssl
+##     - wget --no-check-certificate https://www.openssl.org/source/openssl-${CICD_OPENSSL_VER}.tar.gz
+##     - tar -xvzf openssl-${CICD_OPENSSL_VER}.tar.gz
+##     - cd openssl-${CICD_OPENSSL_VER}
+##     - export OPENSSL_COMPLIER=""
+##     - if [[ "sparc" = "${ARCH}" ]]; then OPENSSL_COMPLIER="solaris64-sparcv9-gcc"; else OPENSSL_COMPLIER="solaris64-x86_64-gcc"; fi
+##     - ./Configure "${OPENSSL_COMPLIER}" --prefix=/usr/local/openssl --openssldir=/usr/local/openssl 2>&1 | tee ~/myopenssl.log
+##     - make 2>&1 | tee -a ~/myopenssl.log
+##     - make install 2>&1 | tee -a ~/myopenssl.log
+##     - cd /usr/bin
+##     - if [[ ! -e /usr/bin/openssl.orig ]]; then mv openssl openssl.orig ; ln -s /usr/local/openssl/bin/openssl /usr/bin/openssl; fi
+##     - export LDFLAGS+=$(PKG_CONFIG_PATH=/usr/local/openssl/lib/pkgconfig pkg-config --libs-only-L libcrypto libssl)
+##     - export CPPFLAGS+=$(PKG_CONFIG_PATH=/usr/local/openssl/lib/pkgconfig pkg-config --cflags libcrypto libssl)
+##     - export CFLAGS+=$(PKG_CONFIG_PATH=/usr/local/openssl/lib/pkgconfig pkg-config --cflags libcrypto libssl)
+##     - export CFLAGS="-DFFI_NO_RAW_API -I/usr/lib/amd64/libffi-3.2.1/include -I/usr/local/openssl/include"
+##     - crle -l /usr/local/openssl/lib:/usr/local/lib:/lib:/usr/lib
+##     - crle -64 -l /usr/local/openssl/lib:/usr/local/lib:/lib/64:/usr/lib/64
+##     - cd ${oldpwd}
+##     - cd dev_python3
+##     - wget --no-check-certificate https://www.python.org/ftp/python/${CICD_PYTHON_VER}/Python-${CICD_PYTHON_VER}.tgz
+##     - tar -xvzf Python-${CICD_PYTHON_VER}.tgz
+##     - cd Python-${CICD_PYTHON_VER}
+##     - export LD_LIBRARY_PATH=/usr/local/openssl/lib:/usr/local/lib:$LD_LIBRARY_PATH
+##     - export PATH=/usr/local/openssl/bin:/usr/local/bin:$PATH
+##     - export LD_RUN_PATH=/usr/local/openssl/lib:/usr/local/lib:$LD_RUN_PATH
+##     - cd Lib/ctypes
+##     - patch -N < ${oldpwd}/solaris11_crle.patch
+##     - cd -
+##     - export PYTHON_OPTS=""
+##     - if [[ "sparc" = "${ARCH}" ]]; then PYTHON_OPTS="--enable-shared --enable-ipv6"; else PYTHON_OPTS="--enable-optimizations --enable-shared --enable-ipv6"; fi
+##     - ./configure ${PYTHON_OPTS} 2>&1 | tee ~/mypython.log
+##     - make altinstall 2>&1 | tee -a ~/mypython.log
+##     - cd /usr/bin
+##     - ln -s -f /usr/local/bin/python3.9 python3
+##     - ln -s -f /usr/local/bin/python3.9 python3.9
+##     - ln -s -f /usr/local/bin/python3.9m-config python3.9m-config
+##     - ln -s -f /usr/local/bin/pip3.9 pip3
+##     ## PyInstaller bootloader for Solaris 11
+##     ## see https://pyinstaller.readthedocs.io/en/stable/bootloader-building.html#building-for-aix
+##     ## ensure empty environment
+##     - python3 -m pip install pyinstaller-hooks-contrib
+##     - python3 -m pip install altgraph
+##     - python3 -m pip install importlib-metadata
+##     - python3 -m pip install wheel
+##     - python3 -m pip install pop-config==8.0.2
+##     - rm -fR ${oldpwd}/dev_pyinstaller
+##     - mkdir -p ${oldpwd}/dev_pyinstaller
+##     - cd ${oldpwd}/dev_pyinstaller
+##     - git clone -b "v${PYINSTALLER_VER}" https://github.com/pyinstaller/pyinstaller.git
+##     ## could not get it or waf to work well, so simple solution of 2-3 days of trying, create a dummy executable /opt/freeware/bin/strip file which does nothing
+##     - echo '#!/usr/bin/bash' > /usr/gnu/bin/strip
+##     - echo "# dummy" >> /usr/gnu/bin/strip
+##     - chmod 755 /usr/gnu/bin/strip
+##     - chown root:bin /usr/gnu/bin/strip
+##     - cd pyinstaller/bootloader
+##     - python3 ./waf configure all --gcc --target-arch=64bit
+##     - cd ..
+##     - export PYINSTALLER_DIR=$(pwd)
+##     - python3 setup.py install
+##     - cd ${oldpwd}
+##     ## Build zeromq for Solaris 11
+##     - rm -fR dev_zeromq
+##     - mkdir dev_zeromq
+##     - cd dev_zeromq
+##     - wget https://github.com/zeromq/libzmq/releases/download/v${CICD_ZEROMQ_VER}/zeromq-${CICD_ZEROMQ_VER}.tar.gz  --secure-protocol=TLSv1_2
+##     - tar -xvzf zeromq-${CICD_ZEROMQ_VER}.tar.gz
+##     ## allow for tar giving id 1000 which isn't even valid on the system :shrug:
+##     - chown -R root:root zeromq-${CICD_ZEROMQ_VER}
+##     - curr_pwd=$(pwd)
+##     - cd "${curr_pwd}/zeromq-${CICD_ZEROMQ_VER}"
+##     - ./configure
+##     - gmake
+##     - gmake install
+##     - cd ${oldpwd}
+##     - python3 -m pip install "tiamat==7.10.7"
+##     - export PATH=$PATH:${HOME}/.local/bin
+##     - export CICD_SALT_DATE=$(date +"%a %b %0d %Y")
+##     ## export CICD_SALT_LOCATION_NB="git+https://github.com/saltstack/salt@$CICD_SALT_DEV_BRANCH#egg=salt"
+##     ## get Salt since salt-minion.xml and minion are needed below, and might as well used
+##     ## it since have it rather than go back out over the net
+##     - cd ${oldpwd}
+##     - rm -fR dev_salt
+##     - mkdir dev_salt
+##     - cd dev_salt
+##     ## - git clone -q https://github.com/saltstack/salt.git
+##     - git clone -v -b ${CICD_SALT_DEV_BRANCH} https://github.com/saltstack/salt.git
+##     - cd salt
+##     - python3 setup.py -q sdist
+##     - cd dist
+##     ## By Hand - cd dev_salt/salt/dist
+##     - ls -alh
+##     - export CICD_SALT_DATE=$(date +"%a %b %0d %Y")
+##     - export CICD_SALT_TAR_GZ_NAME=$(ls salt-*)
+##     - export CICD_SALT_LOCATION_NB=$(pwd)/${CICD_SALT_TAR_GZ_NAME}
+##     - export CICD_SALT_VERSION=$(ls salt-* | sed s/salt-// | sed s/.tar.gz//)
+##     - echo "${CICD_SALT_VERSION}"
+##     - echo "${CICD_SALT_RELEASE}"
+##     - echo "${CICD_SALT_LOCATION}"
+##     - ls -alh
+##     - cd ${oldpwd}
+##     - rm -f solaris11_requirements.txt
+##     - cp requirements.txt solaris11_requirements.txt
+##     - sed -i 's&SALT_LOCATION&'"${CICD_SALT_LOCATION_NB}"'&' solaris11_requirements.txt
+##     - cat solaris11_requirements.txt
+##     - export CICD_SALT_VERSION_ADJ=$(echo "${CICD_SALT_VERSION}" | sed  "s/-/_/"g | sed "s/+/_/"g)
+##     - echo "CICD_SALT_VERSION_ADJ is $CICD_SALT_VERSION_ADJ"
+##     - echo "CICD_SALT_DATE=$CICD_SALT_DATE" > build.env
+##     - echo "CICD_SALT_VERSION=$CICD_SALT_VERSION" >> build.env
+##     - echo "CICD_SALT_VERSION_ADJ=$CICD_SALT_VERSION_ADJ" >> build.env
+##     - echo "CICD_SALT_RELEASE=$CICD_SALT_RELEASE" >> build.env
+##     - export SUN_REPO_NAME="salt_sun11_repo_$(echo "${CICD_SALT_VERSION_ADJ}" | sed  "s/\./_/"g)"
+##     - echo "SUN_REPO_NAME is ${SUN_REPO_NAME}"
+##     - echo "SUN_REPO_NAME=$SUN_REPO_NAME" >> build.env
+##     - cd ${oldpwd}
+##     ## now build
+##     - sed -i 's&PYINSTALLER_LOCATION&'${PYINSTALLER_DIR}'&' build.conf
+##     - cat build.,conf
+##     ## ensure clean area
+##     - rm -fR dist
+##     - rm -fR build
+##     - tiamat --log-file ${oldpwd}/tiamat.log --log-level TRACE build -c build.conf 2>&1 | tee ${oldpwd}/mytiamat.log
+##     ## now package
+##     - find dist -name __pycache__ | xargs rm -fR
+##     - find dist -name "*.pyc" | xargs rm -f
+##     - find dist -name "*.pyo" | xargs rm -f
+##     - rm -f dist/run/setuptools/command/"launcher manifest.xml"
+##     - rm -f dist/run/setuptools/"script (dev).tmpl"
+##     - rm -fR dev_pkg
+##     - rm -f *.p5m*
+##     - export ARCH=$(uname -p)
+##     - echo "ARCH=${ARCH}" >> build.env
+##     - sed -i 's&SOLARIS_ARCH&'${ARCH}'&' salt.mog
+##     - export SALT_VER_TO_USE=$(echo "${CICD_SALT_VERSION_ADJ}" | awk -F '_' '{print $1}' | sed  "s/rc/\./"g)
+##     ## - export SALT_VER_TO_USE=$(echo "${CICD_SALT_VERSION}" | awk -F '_' '{print $1}' | sed  "s/rc/\./"g)
+##     - echo "SALT_VER_TO_USE is ${SALT_VER_TO_USE}"
+##     - sed -i 's&SALT_VER_TO_USE&'${SALT_VER_TO_USE}'&' salt.mog
+##     - ./create_start_repository "${SUN_REPO_NAME}"
+##     - mkdir dev_pkg
+##     - mkdir -p dev_pkg/opt/saltstack/salt
+##     - mkdir -p dev_pkg/opt/saltstack/salt/config.dist
+##     - mkdir -p dev_pkg/opt/local/etc/salt
+##     - mkdir -p dev_pkg/opt/local/etc/salt/minion.d
+##     - mkdir -p dev_pkg/opt/local/etc/salt/pki/minion
+##     - mkdir -p dev_pkg/usr/bin
+##     - cp -R dist/run dev_pkg/opt/saltstack/salt/
+##     - cp salt-call salt-minion dev_pkg/usr/bin/
+##     - cp dev_salt/salt/pkg/solaris/salt-minion.xml dev_pkg/opt/saltstack/salt/config.dist/
+##     - cp dev_salt/salt/conf/minion dev_pkg/opt/local/etc/salt/
+##     ## remove x permission otherwise errors due to no python version specified
+##     - chmod 644 dev_pkg/opt/saltstack/salt/run/pip/_vendor/appdirs.py
+##     - chmod 644 dev_pkg/opt/saltstack/salt/run/pip/_vendor/chardet/cli/chardetect.py
+##     - chmod 644 dev_pkg/opt/saltstack/salt/run/pip/_vendor/requests/certs.py
+##     - chmod 644 dev_pkg/opt/saltstack/salt/run/pkg_resources/_vendor/appdirs.py
+##     ## cleanup dev_salt save space
+##     ## - rm -fR dev_salt
+##     - perl -pi -e 's/\/opt\/local\/bin/\/usr\/bin/' dev_pkg/opt/saltstack/salt/config.dist/salt-minion.xml
+##     - perl -pi -e 's/\/etc\/salt/\/opt\/local\/etc\/salt/' dev_pkg/opt/saltstack/salt/config.dist/salt-minion.xml
+##     - mkdir -p dev_pkg/lib/svc/manifest/site
+##     - mv dev_pkg/opt/saltstack/salt/config.dist/salt-minion.xml dev_pkg/lib/svc/manifest/site/
+##     - cd ${oldpwd}
+##     - ./generate_resolved_pkg ${oldpwd}/dev_pkg ${SUN_REPO_NAME}
+##     ## Sign files here if desired
+##     ## values provided are examples
+##     ## - pkgsign -s /export/${SUN_REPO_NAME} -a rsa-sha256 -c ${oldpwd}/certs/CompanyCert.crt -i ${oldpwd}/certs/CertProviderAuth.crt -i ${oldpwd}/certs/Root_Cert.crt -k ${oldpwd}/certs/code_signing.key '*'
+##     - pkgrecv -s /export/${SUN_REPO_NAME} -a -d ./salt-${CICD_SALT_VERSION_ADJ}_solaris11_${ARCH}.p5p '*'
+##
+##   rules:
+##     - if: $CI_COMMIT_TAG
+##       when: never
+##     - when: on_success
+
+
+build-tags-solaris11-intel:
+  stage: build_pkg
+  artifacts:
+    name: "$CI_JOB_NAME-$CI_COMMIT_REF_NAME"
+    paths:
+      - "*.p5p"
+    expire_in: 120 days
+    reports:
+      dotenv: build.env
+  tags:
+    - solaris11
+  script:
+    - oldpwd=$(pwd)
+    - date
+    - svcadm disable ntp
+    - ntpdate -s time.nist.gov
+    - date
+    - cd ${oldpwd}
+    - export ARCH=$(uname -p)
+    - echo "ARCH is ${ARCH}"
+    - rm -fR dist
+    - rm -fR build
+    - rm -fR dev_openssl
+    - rm -fR dev_python3
+    - mkdir dev_openssl
+    - mkdir dev_python3
+    - mkdir -p /usr/local/lib
+    - mkdir -p /usr/local/bin
+    - pkg change-facet facet.devel=true
+    - pkg install gcc system/header developer/build/pkg-config git developer/build/make text/gnu-patch developer/build/gnu-make text/gnu-grep
+    - export  PKG_CONFIG_PATH=/usr/lib/64/pkgconfig
+    - export PATH=/usr/gnu/bin:$PATH
+    - export CFLAGS=$(pkg-config --cflags libffi)
+    - export PATH=$PATH:/usr/perl5/bin
+    - cd ${oldpwd}
+    - cd dev_openssl
+    - wget --no-check-certificate https://www.openssl.org/source/openssl-${CICD_OPENSSL_VER}.tar.gz
+    - tar -xvzf openssl-${CICD_OPENSSL_VER}.tar.gz
+    - cd openssl-${CICD_OPENSSL_VER}
+    - export OPENSSL_COMPLIER=""
+    - if [[ "sparc" = "${ARCH}" ]]; then OPENSSL_COMPLIER="solaris64-sparcv9-gcc"; else OPENSSL_COMPLIER="solaris64-x86_64-gcc"; fi
+    - ./Configure "${OPENSSL_COMPLIER}" --prefix=/usr/local/openssl --openssldir=/usr/local/openssl 2>&1 | tee ~/myopenssl.log
+    - make 2>&1 | tee ~/mybuild.log
+    - make install 2>&1 | tee -a ~/mybuild.log
+    - cd /usr/bin
+    - if [[ ! -e /usr/bin/openssl.orig ]]; then mv openssl openssl.orig ; ln -s /usr/local/openssl/bin/openssl /usr/bin/openssl; fi
+    - export LDFLAGS+=$(PKG_CONFIG_PATH=/usr/local/openssl/lib/pkgconfig pkg-config --libs-only-L libcrypto libssl)
+    - export CPPFLAGS+=$(PKG_CONFIG_PATH=/usr/local/openssl/lib/pkgconfig pkg-config --cflags libcrypto libssl)
+    - export CFLAGS+=$(PKG_CONFIG_PATH=/usr/local/openssl/lib/pkgconfig pkg-config --cflags libcrypto libssl)
+    - export CFLAGS="-DFFI_NO_RAW_API -I/usr/lib/amd64/libffi-3.2.1/include -I/usr/local/openssl/include"
+    - crle -l /usr/local/openssl/lib:/usr/local/lib:/lib:/usr/lib
+    - crle -64 -l /usr/local/openssl/lib:/usr/local/lib:/lib/64:/usr/lib/64
+    - cd ${oldpwd}
+    - cd dev_python3
+    - wget --no-check-certificate https://www.python.org/ftp/python/${CICD_PYTHON_VER}/Python-${CICD_PYTHON_VER}.tgz
+    - tar -xvzf Python-${CICD_PYTHON_VER}.tgz
+    - cd Python-${CICD_PYTHON_VER}
+    - export LD_LIBRARY_PATH=/usr/local/openssl/lib:/usr/local/lib:$LD_LIBRARY_PATH
+    - export PATH=/usr/local/openssl/bin:/usr/local/bin:$PATH
+    - export LD_RUN_PATH=/usr/local/openssl/lib:/usr/local/lib:$LD_RUN_PATH
+    - cd Lib/ctypes
+    - patch -N < ${oldpwd}/solaris11_crle.patch
+    - cd -
+    - export PYTHON_OPTS=""
+    - if [[ "sparc" = "${ARCH}" ]]; then PYTHON_OPTS="--enable-shared --enable-ipv6"; else PYTHON_OPTS="--enable-optimizations --enable-shared --enable-ipv6"; fi
+    - ./configure ${PYTHON_OPTS} 2>&1 | tee ~/mypython.log
+    - make altinstall 2>&1 | tee -a ~/mypython.log
+    - cd /usr/bin
+    - ln -s -f /usr/local/bin/python3.9 python3
+    - ln -s -f /usr/local/bin/python3.9 python3.9
+    - ln -s -f /usr/local/bin/python3.9m-config python3.9m-config
+    - ln -s -f /usr/local/bin/pip3.9 pip3
+    ## PyInstaller bootloader for Solaris 11
+    ## see https://pyinstaller.readthedocs.io/en/stable/bootloader-building.html#building-for-aix
+    ## ensure empty environment
+    - python3 -m pip install pyinstaller-hooks-contrib
+    - python3 -m pip install altgraph
+    - python3 -m pip install importlib-metadata
+    - python3 -m pip install wheel
+    - python3 -m pip install pop-config==8.0.2
+    - rm -fR ${oldpwd}/dev_pyinstaller
+    - mkdir -p ${oldpwd}/dev_pyinstaller
+    - cd ${oldpwd}/dev_pyinstaller
+    - git clone -b "v${PYINSTALLER_VER}" https://github.com/pyinstaller/pyinstaller.git
+    ## could not get it or waf to work well, so simple solution of 2-3 days of trying, create a dummy executable /opt/freeware/bin/strip file which does nothing
+    - echo '#!/usr/bin/bash' > /usr/gnu/bin/strip
+    - echo "# dummy" >> /usr/gnu/bin/strip
+    - chmod 755 /usr/gnu/bin/strip
+    - chown root:bin /usr/gnu/bin/strip
+    - cd pyinstaller/bootloader
+    - python3 ./waf configure all --gcc --target-arch=64bit
+    - cd ..
+    - export PYINSTALLER_DIR=$(pwd)
+    - python3 setup.py install
+    - cd ${oldpwd}
+    ## Build zeromq for Solaris 11
+    - rm -fR dev_zeromq
+    - mkdir dev_zeromq
+    - cd dev_zeromq
+    - wget https://github.com/zeromq/libzmq/releases/download/v${CICD_ZEROMQ_VER}/zeromq-${CICD_ZEROMQ_VER}.tar.gz  --secure-protocol=TLSv1_2
+    - tar -xvzf zeromq-${CICD_ZEROMQ_VER}.tar.gz
+    ## allow for tar giving id 1000 which isn't even valid on the system :shrug:
+    - chown -R root:root zeromq-${CICD_ZEROMQ_VER}
+    - curr_pwd=$(pwd)
+    - cd "${curr_pwd}/zeromq-${CICD_ZEROMQ_VER}"
+    - ./configure
+    - gmake
+    - gmake install
+    - cd ${oldpwd}
+    - python3 -m pip install "tiamat==7.10.7"
+    - export PATH=$PATH:${HOME}/.local/bin
+    - export CICD_SALT_DATE=$(date +"%a %b %0d %Y")
+    ## export CICD_SALT_LOCATION_NB="git+https://github.com/saltstack/salt@$CICD_SALT_DEV_BRANCH#egg=salt"
+    ## get Salt since salt-minion.xml and minion are needed below, and might as well used
+    ## it since have it rather than go back out over the net
+    ## build Salt
+    - cd ${oldpwd}
+    - rm -fR dev_salt
+    - mkdir dev_salt
+    - cd dev_salt
+    - git clone -q -b ${CICD_SALT_TAG} https://github.com/saltstack/salt.git
+    - cd salt
+    - python3 setup.py -q sdist
+    - cd dist
+    - ls -alh
+    - export CICD_SALT_TAR_GZ_NAME=$(ls salt-*)
+    - export CICD_SALT_LOCATION=$(pwd)/${CICD_SALT_TAR_GZ_NAME}
+    - export CICD_SALT_DATE=$(date +"%a %b %0d %Y")
+    - export CICD_SALT_TAG=$(echo "${CI_COMMIT_TAG}" | cut -d '-' -f 1)
+    - export CICD_SALT_VERSION=$(echo "${CI_COMMIT_TAG}" | sed s/v// | cut -d '-' -f 1)
+    - export CICD_SALT_RELEASE=$(echo "${CI_COMMIT_TAG}" | sed s/v// | cut -d '-' -f 2)
+    - cd ${oldpwd}
+    ## ensure if no release number given default to 1
+    - if [[ "${CICD_SALT_VERSION}" = "${CICD_SALT_RELEASE}" ]]; then export CICD_SALT_RELEASE=1; fi
+    ## - export CICD_SALT_LOCATION="git+https://github.com/saltstack/salt@${CICD_SALT_TAG}#egg=salt"
+    - echo "${CICD_SALT_TAG}"
+    - echo "${CICD_SALT_VERSION}"
+    - echo "${CICD_SALT_RELEASE}"
+    - echo "${CICD_SALT_LOCATION}"
+    - rm -f solaris11_requirements.txt
+    - cp requirements.txt solaris11_requirements.txt
+    - sed -i 's&SALT_LOCATION&'"${CICD_SALT_LOCATION}"'&' solaris11_requirements.txt
+    - cat solaris11_requirements.txt
+    - echo "CICD_SALT_DATE=${CICD_SALT_DATE}" > build.env
+    - echo "CICD_SALT_VERSION=${CICD_SALT_VERSION}" >> build.env
+    - echo "CICD_SALT_RELEASE=${CICD_SALT_RELEASE}" >> build.env
+    - export SUN_REPO_NAME="salt_sun11_repo_$(echo "${CICD_SALT_VERSION}" | sed  "s/\./_/"g)"
+    - echo "SUN_REPO_NAME is ${SUN_REPO_NAME}"
+    - echo "SUN_REPO_NAME=${SUN_REPO_NAME}" >> build.env
+    - cd ${oldpwd}
+    ## now build
+    - sed -i 's&PYINSTALLER_LOCATION&'${PYINSTALLER_DIR}'&' build.conf
+    - cat build.conf
+    ## ensure clean area
+    - rm -fR dist
+    - rm -fR build
+    - tiamat --log-file ${oldpwd}/tiamat.log --log-level TRACE build -c build.conf 2>&1 | tee ${oldpwd}/mytiamat.log
+    - cd ${oldpwd}
+    ## now package
+    - find dist -name __pycache__ | xargs rm -fR
+    - find dist -name "*.pyc" | xargs rm -f
+    - find dist -name "*.pyo" | xargs rm -f
+    - rm -f dist/run/setuptools/command/"launcher manifest.xml"
+    - rm -f dist/run/setuptools/"script (dev).tmpl"
+    - rm -fR dev_pkg
+    - rm -f *.p5m*
+    - echo "ARCH=${ARCH}" >> build.env
+    - sed -i 's&SOLARIS_ARCH&'${ARCH}'&' salt.mog
+    ## - export SALT_VER_TO_USE=$(echo "${CICD_SALT_VERSION_ADJ}" | awk -F '_' '{print $1}' | sed  "s/rc/\./"g)
+    - export SALT_VER_TO_USE=$(echo "${CICD_SALT_VERSION}" | awk -F '_' '{print $1}' | sed  "s/rc/\./"g)
+    - echo "SALT_VER_TO_USE is ${SALT_VER_TO_USE}"
+    - sed -i 's&SALT_VER_TO_USE&'${SALT_VER_TO_USE}'&' salt.mog
+    - cat salt.mog
+    - ./create_start_repository "${SUN_REPO_NAME}"
+    - mkdir dev_pkg
+    - mkdir -p dev_pkg/opt/saltstack/salt
+    - mkdir -p dev_pkg/opt/saltstack/salt/config.dist
+    - mkdir -p dev_pkg/opt/local/etc/salt
+    - mkdir -p dev_pkg/opt/local/etc/salt/minion.d
+    - mkdir -p dev_pkg/opt/local/etc/salt/pki/minion
+    - mkdir -p dev_pkg/usr/bin
+    - cp -R dist/run dev_pkg/opt/saltstack/salt/
+    - cp salt-call salt-minion dev_pkg/usr/bin/
+    - cp dev_salt/salt/pkg/solaris/salt-minion.xml dev_pkg/opt/saltstack/salt/config.dist/
+    - cp dev_salt/salt/conf/minion dev_pkg/opt/local/etc/salt/
+    ## remove x permission otherwise errors due to no python version specified
+    - chmod 644 dev_pkg/opt/saltstack/salt/run/pip/_vendor/appdirs.py
+    - chmod 644 dev_pkg/opt/saltstack/salt/run/pip/_vendor/chardet/cli/chardetect.py
+    - chmod 644 dev_pkg/opt/saltstack/salt/run/pip/_vendor/requests/certs.py
+    - chmod 644 dev_pkg/opt/saltstack/salt/run/pkg_resources/_vendor/appdirs.py
+    ## cleanup dev_salt save space
+    ## - rm -fR dev_salt
+    - perl -pi -e 's/\/opt\/local\/bin/\/usr\/bin/' dev_pkg/opt/saltstack/salt/config.dist/salt-minion.xml
+    - perl -pi -e 's/\/etc\/salt/\/opt\/local\/etc\/salt/' dev_pkg/opt/saltstack/salt/config.dist/salt-minion.xml
+    - mkdir -p dev_pkg/lib/svc/manifest/site
+    - mv dev_pkg/opt/saltstack/salt/config.dist/salt-minion.xml dev_pkg/lib/svc/manifest/site/
+    - cd ${oldpwd}
+    - ./generate_resolved_pkg ${oldpwd}/dev_pkg ${SUN_REPO_NAME}
+    ## Sign files here if desired
+    ## values provided are examples
+    ## - pkgsign -s /export/${SUN_REPO_NAME} -a rsa-sha256 -c ${oldpwd}/certs/CompanyCert.crt -i ${oldpwd}/certs/CertProviderAuth.crt -i ${oldpwd}/certs/Root_Cert.crt -k ${oldpwd}/certs/code_signing.key '*'
+    - pkgrecv -s /export/${SUN_REPO_NAME} -a -d ./salt-${CICD_SALT_VERSION}_solaris11_${ARCH}.p5p '*'
+
+  rules:
+    - if: "$CI_COMMIT_TAG != null && $CI_PROJECT_PATH == $CICD_UPSTREAM_PATH"
+      when: always
+    - when: never
+
+
+## build-tags-solaris11-sparc:
+##   stage: build_pkg
+##   artifacts:
+##     name: "$CI_JOB_NAME-$CI_COMMIT_REF_NAME"
+##     paths:
+##       - "*.p5p"
+##     expire_in: 120 days
+##     reports:
+##       dotenv: build.env
+##   tags:
+##     - solaris11sparc
+##   script:
+##     - oldpwd=$(pwd)
+##     - date
+##     - svcadm disable ntp
+##     - ntpdate -s time.nist.gov
+##     - date
+##     - export ARCH=$(uname -p)
+##     - echo "ARCH is ${ARCH}"
+##     - rm -fR dist
+##     - rm -fR build
+##     - rm -fR dev_openssl
+##     - rm -fR dev_python3
+##     - mkdir dev_openssl
+##     - mkdir dev_python3
+##     - mkdir -p /usr/local/lib
+##     - mkdir -p /usr/local/bin
+##     - pkg change-facet facet.devel=true
+##     - pkg install gcc system/header developer/build/pkg-config git developer/build/make text/gnu-patch developer/build/gnu-make text/gnu-grep
+##     - export  PKG_CONFIG_PATH=/usr/lib/64/pkgconfig
+##     - export CFLAGS=$(pkg-config --cflags libffi)
+##     - export PATH=/usr/gnu/bin:$PATH
+##     - export CFLAGS=$(pkg-config --cflags libffi)
+##     - export PATH=$PATH:/usr/perl5/bin
+##     - cd ${oldpwd}
+##     - cd dev_openssl
+##     - wget --no-check-certificate https://www.openssl.org/source/openssl-${CICD_OPENSSL_VER}.tar.gz
+##     - tar -xvzf openssl-${CICD_OPENSSL_VER}.tar.gz
+##     - cd openssl-${CICD_OPENSSL_VER}
+##     - export OPENSSL_COMPLIER=""
+##     - if [[ "sparc" = "${ARCH}" ]]; then OPENSSL_COMPLIER="solaris64-sparcv9-gcc"; else OPENSSL_COMPLIER="solaris64-x86_64-gcc"; fi
+##     - ./Configure "${OPENSSL_COMPLIER}" --prefix=/usr/local/openssl --openssldir=/usr/local/openssl 2>&1 | tee ~/myopenssl.log
+##     - make 2>&1 | tee ~/mybuild.log
+##     - make install 2>&1 | tee -a ~/mybuild.log
+##     - cd /usr/bin
+##     - if [[ ! -e /usr/bin/openssl.orig ]]; then mv openssl openssl.orig ; ln -s /usr/local/openssl/bin/openssl /usr/bin/openssl; fi
+##     - export LDFLAGS+=$(PKG_CONFIG_PATH=/usr/local/openssl/lib/pkgconfig pkg-config --libs-only-L libcrypto libssl)
+##     - export CPPFLAGS+=$(PKG_CONFIG_PATH=/usr/local/openssl/lib/pkgconfig pkg-config --cflags libcrypto libssl)
+##     - export CFLAGS+=$(PKG_CONFIG_PATH=/usr/local/openssl/lib/pkgconfig pkg-config --cflags libcrypto libssl)
+##     - export CFLAGS="-DFFI_NO_RAW_API -I/usr/lib/amd64/libffi-3.2.1/include -I/usr/local/openssl/include"
+##     - crle -l /usr/local/openssl/lib:/usr/local/lib:/lib:/usr/lib
+##     - crle -64 -l /usr/local/openssl/lib:/usr/local/lib:/lib/64:/usr/lib/64
+##     - cd ${oldpwd}
+##     - cd dev_python3
+##     - wget --no-check-certificate https://www.python.org/ftp/python/${CICD_PYTHON_VER}/Python-${CICD_PYTHON_VER}.tgz
+##     - tar -xvzf Python-${CICD_PYTHON_VER}.tgz
+##     - cd Python-${CICD_PYTHON_VER}
+##     - export LD_LIBRARY_PATH=/usr/local/openssl/lib:/usr/local/lib:$LD_LIBRARY_PATH
+##     - export PATH=/usr/local/openssl/bin:/usr/local/bin:$PATH
+##     - export LD_RUN_PATH=/usr/local/openssl/lib:/usr/local/lib:$LD_RUN_PATH
+##     - cd Lib/ctypes
+##     - patch -N < ${oldpwd}/solaris11_crle.patch
+##     - cd -
+##     - export PYTHON_OPTS=""
+##     - if [[ "sparc" = "${ARCH}" ]]; then PYTHON_OPTS="--enable-shared --enable-ipv6"; else PYTHON_OPTS="--enable-optimizations --enable-shared --enable-ipv6"; fi
+##     - ./configure ${PYTHON_OPTS} 2>&1 | tee ~/mypython.log
+##     - make altinstall 2>&1 | tee -a ~/mypython.log
+##     - cd /usr/bin
+##     - ln -s -f /usr/local/bin/python3.9 python3
+##     - ln -s -f /usr/local/bin/python3.9 python3.9
+##     - ln -s -f /usr/local/bin/python3.9m-config python3.9m-config
+##     - ln -s -f /usr/local/bin/pip3.9 pip3
+##     ## PyInstaller bootloader for Solaris 11
+##     ## see https://pyinstaller.readthedocs.io/en/stable/bootloader-building.html#building-for-aix
+##     ## ensure empty environment
+##     - python3 -m pip install pyinstaller-hooks-contrib
+##     - python3 -m pip install altgraph
+##     - python3 -m pip install importlib-metadata
+##     - python3 -m pip install wheel
+##     - python3 -m pip install pop-config==8.0.2
+##     - rm -fR ${oldpwd}/dev_pyinstaller
+##     - mkdir -p ${oldpwd}/dev_pyinstaller
+##     - cd ${oldpwd}/dev_pyinstaller
+##     - git clone -b "v${PYINSTALLER_VER}" https://github.com/pyinstaller/pyinstaller.git
+##     ## could not get it or waf to work well, so simple solution of 2-3 days of trying, create a dummy executable /opt/freeware/bin/strip file which does nothing
+##     - echo '#!/usr/bin/bash' > /usr/gnu/bin/strip
+##     - echo "# dummy" >> /usr/gnu/bin/strip
+##     - chmod 755 /usr/gnu/bin/strip
+##     - chown root:bin /usr/gnu/bin/strip
+##     - cd pyinstaller/bootloader
+##     - python3 ./waf configure all --gcc --target-arch=64bit
+##     - cd ..
+##     - export PYINSTALLER_DIR=$(pwd)
+##     - python3 setup.py install
+##     - cd ${oldpwd}
+##     ## Build zeromq for Solaris 11
+##     - rm -fR dev_zeromq
+##     - mkdir dev_zeromq
+##     - cd dev_zeromq
+##     - wget https://github.com/zeromq/libzmq/releases/download/v${CICD_ZEROMQ_VER}/zeromq-${CICD_ZEROMQ_VER}.tar.gz  --secure-protocol=TLSv1_2
+##     - tar -xvzf zeromq-${CICD_ZEROMQ_VER}.tar.gz
+##     ## allow for tar giving id 1000 which isn't even valid on the system :shrug:
+##     - chown -R root:root zeromq-${CICD_ZEROMQ_VER}
+##     - curr_pwd=$(pwd)
+##     - cd "${curr_pwd}/zeromq-${CICD_ZEROMQ_VER}"
+##     - ./configure
+##     - gmake
+##     - gmake install
+##     - cd ${oldpwd}
+##     - python3 -m pip install "tiamat==7.10.7"
+##     - export PATH=$PATH:${HOME}/.local/bin
+##     - export CICD_SALT_DATE=$(date +"%a %b %0d %Y")
+##     ## get Salt since salt-minion.xml and minion are needed below, and might as well used
+##     ## it since have it rather than go back out over the net
+##     ## build Salt
+##     - cd ${oldpwd}
+##     - rm -fR dev_salt
+##     - mkdir dev_salt
+##     - cd dev_salt
+##     - git clone -q -b ${CICD_SALT_TAG} https://github.com/saltstack/salt.git
+##     - cd salt
+##     - python3 setup.py -q sdist
+##     - cd dist
+##     - ls -alh
+##     - export CICD_SALT_TAR_GZ_NAME=$(ls salt-*)
+##     - export CICD_SALT_LOCATION=$(pwd)/${CICD_SALT_TAR_GZ_NAME}
+##     - export CICD_SALT_DATE=$(date +"%a %b %0d %Y")
+##     - export CICD_SALT_TAG=$(echo "${CI_COMMIT_TAG}" | cut -d '-' -f 1)
+##     - export CICD_SALT_VERSION=$(echo "${CI_COMMIT_TAG}" | sed s/v// | cut -d '-' -f 1)
+##     - export CICD_SALT_RELEASE=$(echo "${CI_COMMIT_TAG}" | sed s/v// | cut -d '-' -f 2)
+##     - cd ${oldpwd}
+##     ## ensure if no release number given default to 1
+##     - if [[ "${CICD_SALT_VERSION}" = "${CICD_SALT_RELEASE}" ]]; then export CICD_SALT_RELEASE=1; fi
+##     ## - export CICD_SALT_LOCATION="git+https://github.com/saltstack/salt@$CICD_SALT_TAG#egg=salt"
+##     - echo "${CICD_SALT_TAG}"
+##     - echo "${CICD_SALT_VERSION}"
+##     - echo "${CICD_SALT_RELEASE}"
+##     - echo "${CICD_SALT_LOCATION}"
+##     - rm -f solaris11_requirements.txt
+##     - cp requirements.txt solaris11_requirements.txt
+##     - sed -i 's&SALT_LOCATION&'"${CICD_SALT_LOCATION}"'&' solaris11_requirements.txt
+##     - cat solaris11_requirements.txt
+##     - echo "CICD_SALT_VERSION is ${CICD_SALT_VERSION}"
+##     - echo "CICD_SALT_DATE=${CICD_SALT_DATE}" > build.env
+##     - echo "CICD_SALT_VERSION=${CICD_SALT_VERSION}" >> build.env
+##     - export SUN_REPO_NAME="salt_sun11_repo_$(echo "${CICD_SALT_VERSION}" | sed  "s/\./_/"g)"
+##     - echo "SUN_REPO_NAME is ${SUN_REPO_NAME}"
+##     - echo "SUN_REPO_NAME=${SUN_REPO_NAME}" >> build.env
+##     - cd ${oldpwd}
+##     ## now build
+##     - sed -i 's&PYINSTALLER_LOCATION&'${PYINSTALLER_DIR}'&' build.conf
+##     - cat build.conf
+##     ## ensure clean area
+##     - rm -fR dist
+##     - rm -fR build
+##     - tiamat --log-file ${oldpwd}/tiamat.log --log-level TRACE build -c build.conf 2>&1 | tee ${oldpwd}/mytiamat.log
+##     - cd ${oldpwd}
+##     ## now package
+##     - find dist -name __pycache__ | xargs rm -fR
+##     - find dist -name "*.pyc" | xargs rm -f
+##     - find dist -name "*.pyo" | xargs rm -f
+##     - rm -f dist/run/setuptools/command/"launcher manifest.xml"
+##     - rm -f dist/run/setuptools/"script (dev).tmpl"
+##     - rm -fR dev_pkg
+##     - rm -f *.p5m*
+##     - echo "ARCH=${ARCH}" >> build.env
+##     - sed -i 's&SOLARIS_ARCH&'${ARCH}'&' salt.mog
+##     ## - export SALT_VER_TO_USE=$(echo "${CICD_SALT_VERSION_ADJ}" | awk -F '_' '{print $1}' | sed  "s/rc/\./"g)
+##     - export SALT_VER_TO_USE=$(echo "${CICD_SALT_VERSION}" | awk -F '_' '{print $1}' | sed  "s/rc/\./"g)
+##     - echo "SALT_VER_TO_USE is ${SALT_VER_TO_USE}"
+##     - sed -i 's&SALT_VER_TO_USE&'${SALT_VER_TO_USE}'&' salt.mog
+##     - cat salt.mog
+##     - ./create_start_repository "${SUN_REPO_NAME}"
+##     - mkdir dev_pkg
+##     - mkdir -p dev_pkg/opt/saltstack/salt
+##     - mkdir -p dev_pkg/opt/saltstack/salt/config.dist
+##     - mkdir -p dev_pkg/opt/local/etc/salt
+##     - mkdir -p dev_pkg/opt/local/etc/salt/minion.d
+##     - mkdir -p dev_pkg/opt/local/etc/salt/pki/minion
+##     - mkdir -p dev_pkg/usr/bin
+##     - cp -R dist/run dev_pkg/opt/saltstack/salt/
+##     - cp salt-call salt-minion dev_pkg/usr/bin/
+##     - cp dev_salt/salt/pkg/solaris/salt-minion.xml dev_pkg/opt/saltstack/salt/config.dist/
+##     - cp dev_salt/salt/conf/minion dev_pkg/opt/local/etc/salt/
+##     ## remove x permission otherwise errors due to no python version specified
+##     - chmod 644 dev_pkg/opt/saltstack/salt/run/pip/_vendor/appdirs.py
+##     - chmod 644 dev_pkg/opt/saltstack/salt/run/pip/_vendor/chardet/cli/chardetect.py
+##     - chmod 644 dev_pkg/opt/saltstack/salt/run/pip/_vendor/requests/certs.py
+##     - chmod 644 dev_pkg/opt/saltstack/salt/run/pkg_resources/_vendor/appdirs.py
+##     ## cleanup dev_salt save space
+##     ## - rm -fR dev_salt
+##     - perl -pi -e 's/\/opt\/local\/bin/\/usr\/bin/' dev_pkg/opt/saltstack/salt/config.dist/salt-minion.xml
+##     - perl -pi -e 's/\/etc\/salt/\/opt\/local\/etc\/salt/' dev_pkg/opt/saltstack/salt/config.dist/salt-minion.xml
+##     - mkdir -p dev_pkg/lib/svc/manifest/site
+##     - mv dev_pkg/opt/saltstack/salt/config.dist/salt-minion.xml dev_pkg/lib/svc/manifest/site/
+##     - cd ${oldpwd}
+##     - ./generate_resolved_pkg ${oldpwd}/dev_pkg ${SUN_REPO_NAME}
+##     ## Sign files here if desired
+##     ## values provided are examples
+##     ## - pkgsign -s /export/${SUN_REPO_NAME} -a rsa-sha256 -c ${oldpwd}/certs/CompanyCert.crt -i ${oldpwd}/certs/CertProviderAuth.crt -i ${oldpwd}/certs/Root_Cert.crt -k ${oldpwd}/certs/code_signing.key '*'
+##     - pkgrecv -s /export/${SUN_REPO_NAME} -a -d ./salt-${CICD_SALT_VERSION}_solaris11_${ARCH}.p5p '*'
+##
+##   rules:
+##     - if: "$CI_COMMIT_TAG != null && $CI_PROJECT_PATH == $CICD_UPSTREAM_PATH"
+##       when: always
+##     - when: never
+
+
+## On Intel don't need to test in a zone, since new VM instanitated each time
+test-solaris11-intel:
+  stage: test_pkg
+  artifacts:
+    name: "$CI_JOB_NAME-$CI_COMMIT_REF_NAME"
+    expire_in: 120 days
+  tags:
+    - solaris11
+  script:
+    - oldpwd=$(pwd)
+    - date
+    - svcadm disable ntp
+    - ntpdate -s time.nist.gov
+    - date
+    ## ensure system is clean
+    - pkg uninstall library/python/salt-minion || true
+    - rm -f /var/cache/salt /var/log/salt /system/volatile/salt || true
+    - rm -fR test
+    - mkdir test
+    - ls -alh
+    - mv salt-${CICD_SALT_VERSION_ADJ}_solaris11_${ARCH}.p5p test/
+    - cd test
+    - pkg install -g file:///${oldpwd}/test/salt-${CICD_SALT_VERSION_ADJ}_solaris11_${ARCH}.p5p library/python/salt-minion
+    - ls -al /usr/bin/salt-call
+    - ls -al /usr/bin/salt-minion
+    - salt-call --local test.versions
+    - salt-call --local grains.items
+
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - when: on_success
+
+
+## ## TBD need to test in a zone, but to be worked out once have Sparc build machine
+## test-solaris11-sparc:
+##   stage: test_pkg
+##   artifacts:
+##     name: "$CI_JOB_NAME-$CI_COMMIT_REF_NAME"
+##     expire_in: 120 days
+##   tags:
+##     - solaris11sparc-testzone
+##   script:
+##     - oldpwd=$(pwd)
+##     - date
+##     - svcadm disable ntp
+##     - ntpdate -s time.nist.gov
+##     - date
+##     ## ensure system is clean
+##     - pkg uninstall library/python/salt-minion || true
+##     - rm -f /var/cache/salt /var/log/salt /system/volatile/salt || true
+##     - rm -fR test
+##     - mkdir test
+##     - ls -alh
+##     - mv salt-${CICD_SALT_VERSION_ADJ}_solaris11_${ARCH}.p5p test/
+##     - cd test
+##     - pkg install -v -g file:///${oldpwd}/test/salt-${CICD_SALT_VERSION_ADJ}_solaris11_${ARCH}.p5p library/python/salt-minion
+##     - ls -al /usr/bin/salt-call
+##     - ls -al /usr/bin/salt-minion
+##     - salt-call --local test.versions
+##     - salt-call --local grains.items
+##
+##   rules:
+##     - if: $CI_COMMIT_TAG
+##       when: never
+##     - when: on_success
+
+
+## On Intel don't need to test in a zone, since new VM instanitated each time
+test-tags-solaris11-intel:
+  stage: test_pkg
+  artifacts:
+    name: "$CI_JOB_NAME-$CI_COMMIT_REF_NAME"
+    expire_in: 120 days
+  tags:
+    - solaris11
+  script:
+    - oldpwd=$(pwd)
+    - date
+    - svcadm disable ntp
+    - ntpdate -s time.nist.gov
+    - date
+    ## ensure system is clean
+    - pkg uninstall library/python/salt-minion || true
+    - rm -f /var/cache/salt /var/log/salt /system/volatile/salt || true
+    - rm -fR test
+    - mkdir test
+    - echo "current directory is ${oldpwd}"
+    - echo "Salt verison is ${CICD_SALT_VERSION} and arch is ${ARCH}"
+    - ls -alh
+    - mv salt-${CICD_SALT_VERSION}_solaris11_${ARCH}.p5p test/
+    - cd test
+    - pkg install -v -g file:///${oldpwd}/test/salt-${CICD_SALT_VERSION}_solaris11_${ARCH}.p5p library/python/salt-minion
+    - salt-call --local test.versions
+    - salt-call --local grains.items
+
+  rules:
+    - if: "$CI_COMMIT_TAG != null && $CI_PROJECT_PATH == $CICD_UPSTREAM_PATH"
+      when: always
+    - when: never
+
+
+## ## TBD need to test in a zone, but to be worked out once have Sparc build machine
+## test-tags-solaris11-sparc:
+##   stage: test_pkg
+##   artifacts:
+##     name: "$CI_JOB_NAME-$CI_COMMIT_REF_NAME"
+##     expire_in: 120 days
+##   tags:
+##     - solaris11sparc-testzone
+##   script:
+##     - oldpwd=$(pwd)
+##     - date
+##     - svcadm disable ntp
+##     - ntpdate -s time.nist.gov
+##     - date
+##     ## ensure system is clean
+##     - pkg uninstall library/python/salt-minion || true
+##     - rm -f /var/cache/salt /var/log/salt /system/volatile/salt || true
+##     - rm -fR test
+##     - mkdir test
+##     - echo "current directory is ${oldpwd}"
+##     - echo "Salt verison is ${CICD_SALT_VERSION} and arch is ${ARCH}"
+##     - ls -alh
+##     - mv salt-${CICD_SALT_VERSION}_solaris11_${ARCH}.p5p test/
+##     - cd test
+##     - pkg install -v -g file:///${oldpwd}/test/salt-${CICD_SALT_VERSION}_solaris11_${ARCH}.p5p library/python/salt-minion
+##     - salt-call --local test.versions
+##     - salt-call --local grains.items
+##
+##   rules:
+##     - if: "$CI_COMMIT_TAG != null && $CI_PROJECT_PATH == $CICD_UPSTREAM_PATH"
+##       when: always
+##     - when: never

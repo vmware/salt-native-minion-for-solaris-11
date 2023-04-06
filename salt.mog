@@ -1,0 +1,24 @@
+set name=pkg.fmri value=library/python/salt-minion@SALT_VER_TO_USE,5.11
+set name=pkg.description value="Salt addresses Cloud and Datacenter management with remote execution and state management system."
+set name=pkg.summary value="Salt Project Remote Execution and State Management System"
+set name=variant.arch value=SOLARIS_ARCH
+set name=info.classification value="org.opensolaris.category.2008:Applications/System Utilities"
+set name=info.upstream value="Salt Project Community Packaging Team <email-address@example.org>"
+set name=info.upstream-url value="https://github.com/saltstack/salt"
+depend fmri=pkg:/shell/ksh93@93.21.0.20110208-0.175.2.0.0.42.1 type=require
+depend fmri=pkg:/system/core-os@0.5.11-0.175.2.0.0.42.2 type=require
+depend fmri=pkg:/system/network@0.5.11-0.175.2.0.0.42.2 type=require
+<transform dir path=opt -> set group sys >
+<transform dir path=usr -> set group sys >
+<transform dir path=usr/bin -> drop >
+<transform dir path=lib -> drop >
+<transform dir path=lib/svc -> drop >
+<transform dir path=lib/svc/manifest -> set group sys >
+<transform dir path=lib/svc/manifest/site -> set group sys >
+<transform file path=opt/saltstack/salt/run/run -> default restart_fmri 'svc:/system/manifest-import:default' >
+<transform dir path=opt/local -> drop >
+<transform dir path=opt/saltstack/salt -> drop >
+<transform dir path=opt/saltstack/salt/run -> drop >
+<transform dir path=(var|lib)/svc/manifest\$ -> set group sys >
+<transform file path=opt/local/etc/salt/minion -> add preserve renamenew >
+<transform file path=opt/local/etc/salt/minion -> add restart_frmi "svc:/network/salt-minion:*" >
