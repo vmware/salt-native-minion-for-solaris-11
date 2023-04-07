@@ -201,11 +201,6 @@ Your signature certifies that you wrote the patch or have the right to pass it
 on as an open-source patch. For more detailed information,
 refer to [CONTRIBUTING_CLA.md](CONTRIBUTING_CLA.md).
 
-please read our [Developer Certificate of Origin](https://cla.vmware.com/dco).
-All contributions to this repository must be signed as described on that page.
-Your signature certifies that you wrote the patch or have the right to pass it
-on as an open-source patch. For more detailed information,
-refer to [CONTRIBUTING.md](CONTRIBUTING.md).
 The regular Open Source methods of contributing to a project apply:
 
 *   Fork the project
