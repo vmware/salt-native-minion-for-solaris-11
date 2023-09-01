@@ -20,7 +20,7 @@ importlib-metadata==4.11.3
 msgpack==1.0.3
 
 ## git+https://github.com/saltstack/salt@master#egg=salt
-SALT_LOCATION
+# uncomment before use SALT_LOCATION
 
 distro
 
